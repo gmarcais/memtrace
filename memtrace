@@ -15,6 +15,7 @@ $opts = {
   :debug => false,
   :unbalanced => false,
   :output => nil,
+  :raw => nil,
   :file => false,
 }
 
@@ -22,7 +23,7 @@ parser = OptionParser.new do |o|
   o.banner = "#{File.basename($0)} [options] trace_file"
 
   o.on("--ignore-unknown", "Ignore unknown lines") { 
-    $opts[:ignore] = true
+    $onnpts[:ignore] = true
   }
   o.on("--verbose", "Print details for all subprocesses") {
     $opts[:verbose] = true
@@ -39,8 +40,11 @@ parser = OptionParser.new do |o|
   o.on("--debug", "Print debugging information") {
     $opts[:debug] = true
   }
-  o.on("--output FILE", "-o", "Output raw strace to FILE") { |v|
+  o.on("--output FILE", "-o", "Output to FILE instead of stderr") { |v|
     $opts[:output] = v
+  }
+  o.on("--raw FILE", "-r", "Output raw strace to FILE") { |v|
+    $opts[:raw] = v
   }
   o.on("--file", "-f", "Arguments are strace output files") {
     $opts[:file] = true
@@ -90,11 +94,11 @@ class Numeric
   end
 end
 
-def print_report(title, heap, mapped, vm)
-  puts("%10s: heap %10d %8s mmap %10d %8s vm %10d %8s" %
-       [title[0, 10], heap, "(#{heap.to_SI(1024)})",
-        mapped, "(#{mapped.to_SI(1024)})",
-        vm, "(#{vm.to_SI(1024)})"])
+def print_report(io, title, heap, mapped, vm)
+  io.puts("%10s: heap %10d %8s mmap %10d %8s vm %10d %8s" %
+          [title[0, 10], heap, "(#{heap.to_SI(1024)})",
+           mapped, "(#{mapped.to_SI(1024)})",
+           vm, "(#{vm.to_SI(1024)})"])
 end
 
 
@@ -199,10 +203,10 @@ LRGEXP = /^(\d+\s*)?(\w+)\s*\(\s*([^)]*)\s*\)\s*=\s*(.*)$/
 UNFEXP = /^(\d+\s*)?(.*?) <unfinished ...>$/
 RESEXP = /^(\d+\s*)?<... \w+ resumed> (.*)$/
 
-def parse_file(io, pss, out_io = nil)
+def parse_file(io, pss, out_io = stderr, raw_io = nil)
   i = 0
   io.each_line do |l|
-    out_io.print(l) if out_io
+    raw_io.print(l) if raw_io
 
     case l
     when UNFEXP
@@ -227,9 +231,9 @@ def parse_file(io, pss, out_io = nil)
     pid = pid ? pid.chomp.parse_int : 0
     pss.update(pid, cmd, args, res, l)
     if $opts[:debug]
-      p [pid, cmd, args, res]
-      print_report("cur_#{i}", pss.heap, pss.mmaped, pss.vm)
-      print_report("max_#{i}", pss.heap_max, pss.mmaped_max, pss.vm_max)
+      out_io.puts([pid, cmd, args, res].inspect)
+      print_report(out_io, "cur_#{i}", pss.heap, pss.mmaped, pss.vm)
+      print_report(out_io, "max_#{i}", pss.heap_max, pss.mmaped_max, pss.vm_max)
     end
   end
 end
@@ -237,22 +241,25 @@ end
 pss = ProcessStatHash.new
 line_buf = {}
 
+output_io = STDERR
+output_io = open($opts[:output], "w") if $opts[:output]
+
 exit_value = 0
 
 if $opts[:file]
   ARGV.each do |f|
-    open(f) { |io| parse_file(io, pss) }
+    open(f) { |io| parse_file(io, pss, output_io) }
   end
 else
   output_raw = nil
-  output_raw = open($opts[:output], "w")  if $opts[:output]
+  output_raw = open($opts[:raw], "w")  if $opts[:raw]
   r_io, w_io = IO.pipe
   cmd  = ["strace", "-f", "-o", "/dev/fd/#{w_io.fileno}", "-e", "trace=brk,mmap,mremap,munmap"]
   cmd += ARGV
   pid = spawn(*cmd, { r_io => :close, :close_others => false })
   w_io.close
     
-  parse_file(r_io, pss, output_raw)
+  parse_file(r_io, pss, output_io, output_raw)
   Process.wait(pid)
   exit_value = $?.exitstatus
   output_raw.close if output_raw
@@ -260,16 +267,16 @@ end
 
 if $opts[:verbose]
   pss.each do |pid, ps|
-    print_report("cur_#{pid}", ps.heap, ps.mmaped, ps.vm) if $opts[:current]
-    print_report("max_#{pid}", ps.heap_max, ps.mmaped_max, ps.vm_max)
+    print_report(output_io, "cur_#{pid}", ps.heap, ps.mmaped, ps.vm) if $opts[:current]
+    print_report(output_io, "max_#{pid}", ps.heap_max, ps.mmaped_max, ps.vm_max)
   end
 end
 
 
 if $opts[:current]
-  print_report("current", pss.heap, pss.mmaped, pss.vm)
+  print_report(output_io, "current", pss.heap, pss.mmaped, pss.vm)
 end
-print_report("max", pss.heap_max, pss.mmaped_max, pss.vm_max)
+print_report(output_io, "max", pss.heap_max, pss.mmaped_max, pss.vm_max)
 
 if $opts[:unbalanced]
   puts("Unbalanced: ")
