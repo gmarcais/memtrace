@@ -20,10 +20,10 @@ $opts = {
 }
 
 parser = OptionParser.new do |o|
-  o.banner = "#{File.basename($0)} [options] trace_file"
+  o.banner = "#{File.basename($0)} [options] trace_file|command"
 
   o.on("--ignore-unknown", "Ignore unknown lines") { 
-    $onnpts[:ignore] = true
+    $opts[:ignore] = true
   }
   o.on("--verbose", "Print details for all subprocesses") {
     $opts[:verbose] = true
@@ -54,7 +54,11 @@ parser = OptionParser.new do |o|
     exit(0)
   }
 end
-parser.parse!(ARGV)
+parser.order!(ARGV)
+if ARGV.empty?
+  STDERR.puts("Missing arguments. See --help for details")
+  exit(1)
+end
 
 class String
   def parse_int
@@ -103,7 +107,8 @@ end
 
 
 class ProcessStats
-  def initialize(known_addr)
+  def initialize(known_addr, pid)
+    @pid = pid
     @brk_base = @brk_cur = nil
     @heap = @heap_max = 0
     @mmaped = @mmaped_max = 0
@@ -113,6 +118,7 @@ class ProcessStats
   
   attr_reader :heap_max, :mmaped_max, :vm_max
   attr_reader :heap, :mmaped, :vm
+  attr_reader :brk_base, :brk_cur, :pid
 
   def update_vm
     @vm = @heap + @mmaped
@@ -122,8 +128,10 @@ class ProcessStats
   def brk(args, res, line)
     addr = args.parse_int
     res = res.parse_int
+    return if !@brk_cur.nil? && res <= @brk_cur
     if addr == 0
-      @brk_cur = @brk_base = res
+      @brk_cur = res
+      @brk_base ||= res
     else
       @brk_cur = res
       @heap = @brk_cur - @brk_base
@@ -131,7 +139,7 @@ class ProcessStats
     end
     update_vm
   end
-  
+
   def mmap(args, res, line)
     res = res.split[0].parse_int
     return if res == -1
@@ -176,7 +184,7 @@ end
 class ProcessStatHash
   def initialize
     @known_addr = {}
-    @hash = Hash.new { |h, k| h[k] = ProcessStats.new(@known_addr) }
+    @hash = Hash.new { |h, k| h[k] = ProcessStats.new(@known_addr, k) }
     @heap = @mmaped = @vm = 0
     @heap_max = @mmaped_max = @vm_max = 0
   end
@@ -186,14 +194,23 @@ class ProcessStatHash
 
   def update(pid, cmd, args, res, line)
     ps = @hash[pid]
-    ps_heap, ps_mmaped, ps_vm = ps.heap, ps.mmaped, ps.vm
-    ps.__send__(cmd, args, res, line)
-    @heap += ps.heap - ps_heap
-    @mmaped += ps.mmaped - ps_mmaped
-    @vm += ps.vm - ps_vm
-    @heap_max = @heap if @heap > @heap_max
-    @mmaped_max = @mmaped if @mmaped > @mmaped_max
-    @vm_max = @vm if @vm > @vm_max
+
+    case cmd
+    when "clone"
+      res = res.parse_int
+      return if res == -1
+      @hash[res] = ps if args =~ /CLONE_VM/
+
+    else
+      ps_heap, ps_mmaped, ps_vm = ps.heap, ps.mmaped, ps.vm
+      ps.__send__(cmd, args, res, line)
+      @heap += ps.heap - ps_heap
+      @mmaped += ps.mmaped - ps_mmaped
+      @vm += ps.vm - ps_vm
+      @heap_max = @heap if @heap > @heap_max
+      @mmaped_max = @mmaped if @mmaped > @mmaped_max
+      @vm_max = @vm if @vm > @vm_max
+    end
   end
 
   def each(&block); @hash.each(&block); end
@@ -202,13 +219,23 @@ end
 LRGEXP = /^(\d+\s*)?(\w+)\s*\(\s*([^)]*)\s*\)\s*=\s*(.*)$/
 UNFEXP = /^(\d+\s*)?(.*?) <unfinished ...>$/
 RESEXP = /^(\d+\s*)?<... \w+ resumed> (.*)$/
+SIGEXP = /^(\d+\s*)?---[^-]*---$/
 
 def parse_file(io, pss, out_io = stderr, raw_io = nil)
   i = 0
+  line_buf = {}
+
   io.each_line do |l|
-    raw_io.print(l) if raw_io
+    if raw_io
+      raw_io.print(l)
+      raw_io.flush
+      raw_io.fsync
+    end
 
     case l
+    when SIGEXP
+      next
+
     when UNFEXP
       pid = $1 ? $1.chomp.parse_int : 0
       line_buf[pid] = "#{pid} #{$2}"
@@ -238,52 +265,56 @@ def parse_file(io, pss, out_io = stderr, raw_io = nil)
   end
 end
 
-pss = ProcessStatHash.new
-line_buf = {}
-
-output_io = STDERR
-output_io = open($opts[:output], "w") if $opts[:output]
-
 exit_value = 0
+begin
+  pss = ProcessStatHash.new
 
-if $opts[:file]
-  ARGV.each do |f|
-    open(f) { |io| parse_file(io, pss, output_io) }
-  end
-else
-  output_raw = nil
-  output_raw = open($opts[:raw], "w")  if $opts[:raw]
-  r_io, w_io = IO.pipe
-  cmd  = ["strace", "-f", "-o", "/dev/fd/#{w_io.fileno}", "-e", "trace=brk,mmap,mremap,munmap"]
-  cmd += ARGV
-  pid = spawn(*cmd, { r_io => :close, :close_others => false })
-  w_io.close
+  output_io = $opts[:file] ? STDOUT : STDERR
+  output_io = open($opts[:output], "w") if $opts[:output]
+
+
+  if $opts[:file]
+    ARGV.each do |f|
+      open(f) { |io| parse_file(io, pss, output_io) }
+    end
+  else
+    output_raw = nil
+    output_raw = open($opts[:raw], "w")  if $opts[:raw]
+    r_io, w_io = IO.pipe
+    cmd  = ["strace", "-f", "-o", "/dev/fd/#{w_io.fileno}", "-e", "trace=brk,mmap,mremap,munmap,clone"]
+    cmd += ARGV
+    pid = spawn(*cmd, { r_io => :close, :close_others => false })
+    w_io.close
     
-  parse_file(r_io, pss, output_io, output_raw)
-  Process.wait(pid)
-  exit_value = $?.exitstatus
-  output_raw.close if output_raw
-end
-
-if $opts[:verbose]
-  pss.each do |pid, ps|
-    print_report(output_io, "cur_#{pid}", ps.heap, ps.mmaped, ps.vm) if $opts[:current]
-    print_report(output_io, "max_#{pid}", ps.heap_max, ps.mmaped_max, ps.vm_max)
+    parse_file(r_io, pss, output_io, output_raw)
+    Process.wait(pid)
+    exit_value = $?.exitstatus
+    r_io.close
+    output_raw.close if output_raw
   end
-end
+
+  if $opts[:verbose]
+    pss.each do |pid, ps|
+      print_report(output_io, "cur_#{pid}", ps.heap, ps.mmaped, ps.vm) if $opts[:current]
+      print_report(output_io, "max_#{pid}", ps.heap_max, ps.mmaped_max, ps.vm_max)
+    end
+  end
 
 
-if $opts[:current]
-  print_report(output_io, "current", pss.heap, pss.mmaped, pss.vm)
-end
-print_report(output_io, "max", pss.heap_max, pss.mmaped_max, pss.vm_max)
+  if $opts[:current]
+    print_report(output_io, "current", pss.heap, pss.mmaped, pss.vm)
+  end
+  print_report(output_io, "max", pss.heap_max, pss.mmaped_max, pss.vm_max)
 
-if $opts[:unbalanced]
-  puts("Unbalanced: ")
-  pss.known_addr.each { |k, v|
-    puts("0x%16x %s" % [k, v.shift])
-    v.each { |l| puts("                   #{l}") }
-  }
+  if $opts[:unbalanced]
+    puts("Unbalanced: ")
+    pss.known_addr.each { |k, v|
+      puts("0x%16x %s" % [k, v.shift])
+      v.each { |l| puts("                   #{l}") }
+    }
+  end
+rescue Errno::EPIPE
+# ignore
 end
 
 exit(exit_value)
