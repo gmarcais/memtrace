@@ -187,6 +187,7 @@ class ProcessStatHash
     @hash = Hash.new { |h, k| h[k] = ProcessStats.new(@known_addr, k) }
     @heap = @mmaped = @vm = 0
     @heap_max = @mmaped_max = @vm_max = 0
+    @warned = false
   end
   attr_reader :heap, :mmaped, :vm
   attr_reader :heap_max, :mmaped_max, :vm_max
@@ -201,7 +202,7 @@ class ProcessStatHash
       return if res == -1
       @hash[res] = ps if args =~ /CLONE_VM/
 
-    else
+    when "brk", "mmap", "mremap", "munmap"
       ps_heap, ps_mmaped, ps_vm = ps.heap, ps.mmaped, ps.vm
       ps.__send__(cmd, args, res, line)
       @heap += ps.heap - ps_heap
@@ -210,6 +211,12 @@ class ProcessStatHash
       @heap_max = @heap if @heap > @heap_max
       @mmaped_max = @mmaped if @mmaped > @mmaped_max
       @vm_max = @vm if @vm > @vm_max
+
+    else
+      if !@warned
+        STDERR.puts("Warning: unknown system calls in input. The results should still be correct unless some of the 'brk', 'mmap', 'mremap', 'munmap' and 'clone' calls are missing")
+        @warned = true
+      end
     end
   end
 
