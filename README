@@ -1,0 +1,60 @@
+Introduction
+============
+
+'memtrace' is a software to measure the memory usage of a piece of
+software. The software is run with 'strace' to find all the system
+calls made and the memory usage is computed from the calls that deal
+with memory allocation (in Linux those are 'brk', 'mmap', 'mremap',
+'munmap'). The 'clone' system call is also checked to handle properly
+multi-threaded applications.
+
+This software is most likely Linux specific at this point.
+
+Installation
+============
+
+'memtrace' is a one-file ruby script, so Ruby must be
+installed. Simply copy 'memtrace' somewhere in your path and make it
+executable. For example:
+
+$ cp memtrace ~/bin
+$ chmod a+x ~/bin/memtrace
+
+Usage
+=====
+
+The simplest way is to prepend your command with 'memtrace'. The
+command will be run normally and when done, the maximum memory usage
+is printed to stderr (similarly to the way 'time' works). For example:
+
+$ memtrace ls >/dev/null
+       max: heap     135168   (132k) mmap     136168   (133k) vm     271336   (265k)
+
+The redirection of stdout (i.e. >/dev/null) discards the output of
+'ls' and only the output of 'memtrace' is shown.
+
+By default, only the memory page which have write access are
+counted. The pages used by the code of the shared library are not
+counted. In other words, what is reported is only the memory used by
+the software to store things in memory.
+
+To include all the pages, included the read only ones, use the '--all' switch:
+
+$  memtrace --all ls >/dev/null
+       max: heap     135168   (132k) mmap   18297680  (17.5M) vm   18432848  (17.6M)
+
+The raw output of strace can be saved to a file to be examined by
+'memtrace' later. For example:
+
+$ memtrace -r trace ls >/dev/null
+       max: heap     135168   (132k) mmap     136168   (133k) vm     271336   (265k)
+$ memtrace -f trace
+       max: heap     135168   (132k) mmap     136168   (133k) vm     271336   (265k)
+$ memtrace -f --all trace
+       max: heap     135168   (132k) mmap   18297680  (17.5M) vm   18432848  (17.6M)
+
+Author & License
+================
+
+This software is copyrighted to Guillaume Marcais
+<guillaume@marcais.net> and licensed under the GPL. See COPYING.
