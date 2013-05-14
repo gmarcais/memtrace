@@ -24,12 +24,12 @@ $opts = {
   :ignore => false,
   :all => false,
   :verbose => false,
-  :current => false,
   :debug => false,
   :unbalanced => false,
   :output => nil,
   :raw => nil,
   :file => false,
+  :gprefix => nil,
 }
 
 parser = OptionParser.new do |o|
@@ -44,8 +44,8 @@ parser = OptionParser.new do |o|
   o.on("--all", "Include read only maps in count") {
     $opts[:all] = true
   }
-  o.on("--current", "Display current counts as well") {
-    $opts[:current] = true
+  o.on("--gprefix PREFIX", "Prefix for graph files. Draw with 'gnuplot -p PREFIX.gp'") { |v|
+    $opts[:gprefix] = v
   }
   o.on("--unbalanced", "Display unbalanced mmap/munmap calls") {
     $opts[:unbalanced] = true
@@ -118,6 +118,31 @@ def print_report(io, title, heap, mapped, vm)
            vm, "(#{vm.to_SI(1024)})"])
 end
 
+class Graph
+  def initialize(prefix)
+    @prefix = prefix
+    @data = File.open(@prefix + ".data", "w")
+    @data.puts("#time heap mmaped vm")
+    @base_time = nil
+  end
+
+  def add(time, heap, mmapped, vm)
+    @base_time = time unless @base_time
+    @data.puts("#{time - @base_time} #{heap / 1024} #{mmapped / 1024} #{vm / 1024}")
+  end
+
+  def close
+    @data.close
+    open(@prefix + ".gp", "w") { |fd|
+      fd.puts("set title \"memtrace\"",
+              "set xlabel \"time (s)\"",
+              "set ylabel \"Memory (Kb)\"",
+              "set key on outside",
+              "set style data linespoints",
+              "plot \"#{@prefix + ".data"}\" using 1:4 title \"vm\", \"\" using 1:2 title \"heap\", \"\" using 1:3 title \"mmap\"")
+    }
+  end
+end
 
 class ProcessStats
   def initialize(known_addr, pid)
@@ -201,12 +226,14 @@ class ProcessStatHash
     @heap = @mmaped = @vm = 0
     @heap_max = @mmaped_max = @vm_max = 0
     @warned = false
+    @graph = nil
   end
   attr_reader :heap, :mmaped, :vm
   attr_reader :heap_max, :mmaped_max, :vm_max
   attr_reader :known_addr
+  attr_accessor :graph
 
-  def update(pid, cmd, args, res, line)
+  def update(time, pid, cmd, args, res, line)
     ps = @hash[pid]
 
     case cmd
@@ -224,6 +251,7 @@ class ProcessStatHash
       @heap_max = @heap if @heap > @heap_max
       @mmaped_max = @mmaped if @mmaped > @mmaped_max
       @vm_max = @vm if @vm > @vm_max
+      @graph.add(time, @heap, @mmaped, @vm) if @graph
 
     else
       if !@warned
@@ -236,20 +264,22 @@ class ProcessStatHash
   def each(&block); @hash.each(&block); end
 end
 
-LRGEXP = /^(\d+\s*)?(\w+)\s*\(\s*([^)]*)\s*\)\s*=\s*(.*)$/
-UNFEXP = /^(\d+\s*)?(.*?) <unfinished ...>$/
-RESEXP = /^(\d+\s*)?<... \w+ resumed> (.*)$/
-SIGEXP = /^(\d+\s*)?---[^-]*---$/
+LRGEXP = /^(\d+\s*)?(\d+.\d+\s*)?(\w+)\s*\(\s*([^)]*)\s*\)\s*=\s*(.*)$/
+UNFEXP = /^(\d+\s*)?(\d+.\d+\s*)?(.*?) <unfinished ...>$/
+RESEXP = /^(\d+\s*)?(\d+.\d+\s*)?<... \w+ resumed> (.*)$/
+SIGEXP = /^(\d+\s*)?(\d+.\d+\s*)?---[^-]*---$/
 
 def parse_file(io, pss, out_io = stderr, raw_io = nil)
   i = 0
   line_buf = {}
+  graph = nil
+  pss.graph = $opts[:gprefix] && Graph.new($opts[:gprefix])
 
   io.each_line do |l|
     if raw_io
       raw_io.print(l)
-      raw_io.flush
-      raw_io.fsync
+#      raw_io.flush
+#      raw_io.fsync
     end
 
     case l
@@ -257,13 +287,13 @@ def parse_file(io, pss, out_io = stderr, raw_io = nil)
       next
 
     when UNFEXP
-      pid = $1 ? $1.chomp.parse_int : 0
-      line_buf[pid] = "#{pid} #{$2}"
+      pid = $1 ? $2.chomp.parse_int : 0
+      line_buf[pid] = "#{pid} #{$3}"
       next
 
     when RESEXP
-      pid = $1 ? $1.chomp.parse_int : 0
-      line = line_buf[pid] + $2
+      pid = $1 ? $2.chomp.parse_int : 0
+      line = line_buf[pid] + $3
     else
       line = l
     end
@@ -274,15 +304,19 @@ def parse_file(io, pss, out_io = stderr, raw_io = nil)
     end
 
     i += 1
-    pid, cmd, args, res = $1, $2, $3, $4
+    pid, time, cmd, args, res = $1, $2, $3, $4, $5
+    time = time.to_f
     pid = pid ? pid.chomp.parse_int : 0
-    pss.update(pid, cmd, args, res, l)
+    pss.update(time, pid, cmd, args, res, l)
     if $opts[:debug]
       out_io.puts([pid, cmd, args, res].inspect)
       print_report(out_io, "cur_#{i}", pss.heap, pss.mmaped, pss.vm)
       print_report(out_io, "max_#{i}", pss.heap_max, pss.mmaped_max, pss.vm_max)
     end
   end
+
+ensure
+  pss.graph.close if pss.graph
 end
 
 exit_value = 0
@@ -301,7 +335,7 @@ begin
     output_raw = nil
     output_raw = open($opts[:raw], "w")  if $opts[:raw]
     r_io, w_io = IO.pipe
-    cmd  = ["strace", "-f", "-o", "/dev/fd/#{w_io.fileno}", "-e", "trace=brk,mmap,mremap,munmap,clone"]
+    cmd  = ["strace", "-ttt", "-f", "-o", "/dev/fd/#{w_io.fileno}", "-e", "trace=brk,mmap,mremap,munmap,clone"]
     cmd += ARGV
     pid = spawn(*cmd, { r_io => :close, :close_others => false })
     w_io.close
@@ -315,21 +349,17 @@ begin
 
   if $opts[:verbose]
     pss.each do |pid, ps|
-      print_report(output_io, "cur_#{pid}", ps.heap, ps.mmaped, ps.vm) if $opts[:current]
       print_report(output_io, "max_#{pid}", ps.heap_max, ps.mmaped_max, ps.vm_max)
     end
   end
 
 
-  if $opts[:current]
-    print_report(output_io, "current", pss.heap, pss.mmaped, pss.vm)
-  end
   print_report(output_io, "max", pss.heap_max, pss.mmaped_max, pss.vm_max)
 
   if $opts[:unbalanced]
-    puts("Unbalanced: ")
+    output_io.puts("Unbalanced: ")
     pss.known_addr.each { |k, v|
-      puts("0x%16x %s" % [k, v.shift])
+      output_io.puts("0x%16x %s" % [k, v.shift])
       v.each { |l| puts("                   #{l}") }
     }
   end
