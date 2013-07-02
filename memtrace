@@ -128,7 +128,8 @@ class Graph
 
   def add(time, heap, mmapped, vm)
     @base_time = time unless @base_time
-    @data.puts("#{time - @base_time} #{heap / 1024} #{mmapped / 1024} #{vm / 1024}")
+    s = "#{time - @base_time} #{heap / 1024} #{mmapped / 1024} #{vm / 1024}"
+    @data.puts(s)
   end
 
   def close
@@ -138,8 +139,9 @@ class Graph
               "set xlabel \"time (s)\"",
               "set ylabel \"Memory (Kb)\"",
               "set key on outside",
-              "set style data linespoints",
-              "plot \"#{@prefix + ".data"}\" using 1:4 title \"vm\", \"\" using 1:2 title \"heap\", \"\" using 1:3 title \"mmap\"")
+              "set style data steps",
+              "plot \"#{@prefix + ".data"}\" using 1:4 title \"vm\" ls 1, \"\" using 1:2 title \"heap\" ls 2, \"\" using 1:3 title \"mmap\" ls 3",
+              "replot \"#{@prefix + ".data"}\" using 1:4 title \"\" ls 1, \"\" using 1:2 title \"\" ls 2, \"\" using 1:3 title \"\" ls 3")
     }
   end
 end
@@ -253,6 +255,14 @@ class ProcessStatHash
       @vm_max = @vm if @vm > @vm_max
       @graph.add(time, @heap, @mmaped, @vm) if @graph
 
+    when "die", "exit_group"
+      if ps.pid == pid
+        @heap -= ps.heap
+        @mmaped -= ps.mmaped
+        @vm -= ps.vm
+        @graph.add(time, @heap, @mmaped, @vm) if @graph
+      end
+
     else
       if !@warned
         STDERR.puts("Warning: unknown system calls in input. The results should still be correct unless some of the 'brk', 'mmap', 'mremap', 'munmap' and 'clone' calls are missing")
@@ -268,6 +278,7 @@ LRGEXP = /^(\d+\s*)?(\d+.\d+\s*)?(\w+)\s*\(\s*([^)]*)\s*\)\s*=\s*(.*)$/
 UNFEXP = /^(\d+\s*)?(\d+.\d+\s*)?(.*?) <unfinished ...>$/
 RESEXP = /^(\d+\s*)?(\d+.\d+\s*)?<... \w+ resumed> (.*)$/
 SIGEXP = /^(\d+\s*)?(\d+.\d+\s*)?---[^-]*---$/
+KILEXP = /^(\d+\s*)?(\d+.\d+\s*)?\+\+\+ killed by (\w+) \+\+\+/
 
 def parse_file(io, pss, out_io = stderr, raw_io = nil)
   i = 0
@@ -276,6 +287,7 @@ def parse_file(io, pss, out_io = stderr, raw_io = nil)
   pss.graph = $opts[:gprefix] && Graph.new($opts[:gprefix])
 
   io.each_line do |l|
+    out_io.puts("--> #{l}") if $opts[:debug]
     if raw_io
       raw_io.print(l)
 #      raw_io.flush
@@ -285,15 +297,24 @@ def parse_file(io, pss, out_io = stderr, raw_io = nil)
     case l
     when SIGEXP
       next
+      
+    when KILEXP
+      pid = $1 ? $1.chomp.parse_int : 0
+      time = $2.to_f
+      STDERR.puts("-kill #{l}",
+                  "-k-> #{time} #{pid}")
+      pss.update(time, pid, "die", nil, nil, l)
+      next
 
     when UNFEXP
-      pid = $1 ? $2.chomp.parse_int : 0
-      line_buf[pid] = "#{pid} #{$3}"
+      pid = $1 ? $1.chomp.parse_int : 0
+      line_buf[pid] = $3
       next
 
     when RESEXP
-      pid = $1 ? $2.chomp.parse_int : 0
-      line = line_buf[pid] + $3
+      pid = $1 ? $1.chomp.parse_int : 0
+      line = "#{$1} #{$2} #{line_buf[pid]} #{$3}"
+
     else
       line = l
     end
@@ -319,7 +340,7 @@ ensure
   pss.graph.close if pss.graph
 end
 
-exit_value = 0
+exit_value = nil
 begin
   pss = ProcessStatHash.new
 
@@ -335,14 +356,14 @@ begin
     output_raw = nil
     output_raw = open($opts[:raw], "w")  if $opts[:raw]
     r_io, w_io = IO.pipe
-    cmd  = ["strace", "-ttt", "-f", "-o", "/dev/fd/#{w_io.fileno}", "-e", "trace=brk,mmap,mremap,munmap,clone"]
+    cmd  = ["strace", "-ttt", "-f", "-o", "/dev/fd/#{w_io.fileno}", "-e", "trace=brk,mmap,mremap,munmap,clone,exit_group"]
     cmd += ARGV
     pid = spawn(*cmd, { r_io => :close, :close_others => false })
     w_io.close
     
     parse_file(r_io, pss, output_io, output_raw)
     Process.wait(pid)
-    exit_value = $?.exitstatus
+    exit_value = $?
     r_io.close
     output_raw.close if output_raw
   end
@@ -367,4 +388,10 @@ rescue Errno::EPIPE
 # ignore
 end
 
-exit(exit_value)
+exit(0) if exit_value.nil?
+if exit_value.exited?
+  exit(exit_value.exitstatus)
+elsif exit_value.signaled?
+  trap(exit_value.termsig, "SYSTEM_DEFAULT")
+  Process.kill(exit_value.termsig, 0)
+end
