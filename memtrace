@@ -274,7 +274,7 @@ class ProcessStatHash
   def each(&block); @hash.each(&block); end
 end
 
-LRGEXP = /^(\d+\s*)?(\d+.\d+\s*)?(\w+)\s*\(\s*([^)]*)\s*\)\s*=\s*(.*)$/
+LRGEXP = /^(\d+\s*)?(\d+.\d+\s*)?(\w+)\s*\((.*?)\)\s*=\s*(.*)$/
 UNFEXP = /^(\d+\s*)?(\d+.\d+\s*)?(.*?) <unfinished ...>$/
 RESEXP = /^(\d+\s*)?(\d+.\d+\s*)?<... \w+ resumed> (.*)$/
 SIGEXP = /^(\d+\s*)?(\d+.\d+\s*)?---[^-]*---$/
