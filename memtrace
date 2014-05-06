@@ -229,6 +229,7 @@ class ProcessStatHash
     @heap_max = @mmaped_max = @vm_max = 0
     @warned = false
     @graph = nil
+    @dead = false
   end
   attr_reader :heap, :mmaped, :vm
   attr_reader :heap_max, :mmaped_max, :vm_max
@@ -256,11 +257,12 @@ class ProcessStatHash
       @graph.add(time, @heap, @mmaped, @vm) if @graph
 
     when "die", "exit_group"
-      if ps.pid == pid
+      if ps.pid == pid && !@dead
         @heap -= ps.heap
         @mmaped -= ps.mmaped
         @vm -= ps.vm
         @graph.add(time, @heap, @mmaped, @vm) if @graph
+        @dead = true
       end
 
     else
@@ -279,6 +281,7 @@ UNFEXP = /^(\d+\s*)?(\d+.\d+\s*)?(.*?) <unfinished ...>$/
 RESEXP = /^(\d+\s*)?(\d+.\d+\s*)?<... \w+ resumed> (.*)$/
 SIGEXP = /^(\d+\s*)?(\d+.\d+\s*)?---[^-]*---$/
 KILEXP = /^(\d+\s*)?(\d+.\d+\s*)?\+\+\+ killed by (\w+) \+\+\+/
+EXTEXP = /^(\d+\s*)?(\d+.\d+\s*)?\+\+\+ exited with (\d+) \+\+\+/
 
 def parse_file(io, pss, out_io = stderr, raw_io = nil)
   i = 0
@@ -290,19 +293,15 @@ def parse_file(io, pss, out_io = stderr, raw_io = nil)
     out_io.puts("--> #{l}") if $opts[:debug]
     if raw_io
       raw_io.print(l)
-#      raw_io.flush
-#      raw_io.fsync
     end
 
     case l
     when SIGEXP
       next
       
-    when KILEXP
+    when KILEXP, EXTEXP
       pid = $1 ? $1.chomp.parse_int : 0
       time = $2.to_f
-      STDERR.puts("-kill #{l}",
-                  "-k-> #{time} #{pid}")
       pss.update(time, pid, "die", nil, nil, l)
       next
 
