@@ -357,7 +357,7 @@ begin
     r_io, w_io = IO.pipe
     cmd  = ["strace", "-ttt", "-f", "-o", "/dev/fd/#{w_io.fileno}", "-e", "trace=brk,mmap,mremap,munmap,clone,exit_group"]
     cmd += ARGV
-    pid = spawn(*cmd, { r_io => :close, :close_others => false })
+    pid = spawn(*cmd, { :close_others => true, w_io => w_io })
     w_io.close
     
     parse_file(r_io, pss, output_io, output_raw)
